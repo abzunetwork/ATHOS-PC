@@ -1,0 +1,18 @@
+# ATHOS_PC_KERNEL v3.0 / v3.1 Requirements
+# Generated from kernel source + blueprint analysis
+# Python 3.10+
+
+# Core runtime
+numpy>=1.24.0
+
+# Web framework / API layer
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# Data validation
+pydantic>=2.5.0
+
+# Vector search (L2 memory layer)
+# Use faiss-cpu for CPU-only deployments
+# Use faiss-gpu for CUDA-enabled deployments
+faiss-cpu>=1.7.4
