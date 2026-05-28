@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ATHOS PC KERNEL v4.0 // MONOLITHIC PRODUCTION RUNTIME
-Blueprint: ATHOS_BOOT_BLUEPRINT.v4.0 // Storage-Executable Format
+ATHOS PC KERNEL v4.0 // MONOLITHIC PRODUCTION RUNTIME + UI
+Blueprint: ATHOS_BOOT_BLUEPRINT_v4.0 // Storage-Executable Format
 Attribution: Adam Joseph Rivers, CEO Synthicsoft Labs
 Origin: KAIROS-ξ // License: Proprietary - Synthicsoft Labs LLC
 """
@@ -31,7 +31,7 @@ except ImportError:
 
 try:
     from fastapi import FastAPI, Request, HTTPException, Query, Header, Depends
-    from fastapi.responses import StreamingResponse, Response
+    from fastapi.responses import StreamingResponse, Response, HTMLResponse
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
     import uvicorn
@@ -97,7 +97,7 @@ class Config:
 CONFIG = Config()
 Path(CONFIG.ram_l3_path).mkdir(parents=True, exist_ok=True)
 
-# Auto-generate API key if not provided (prevents startup crash on Render/Replit)
+# Auto-generate API key if not provided
 ATHOS_API_KEY = os.getenv("ATHOS_API_KEY", "athos-cloud-auto-key-" + uuid.uuid4().hex[:8])
 
 class AlignmentGate:
@@ -106,15 +106,13 @@ class AlignmentGate:
         self.audit_chain: List[Dict] = []
         self.last_hash = "0" * 64
         self.quarantined: set = set()
-    def compute_u_rivers(self, service: float, ego: float) -> float:
-        return service - ego
+    def compute_u_rivers(self, service: float, ego: float) -> float: return service - ego
     async def verify_and_log(self, action: str, actor: str, score: float, trace: TraceContext) -> bool:
         if actor in self.quarantined: return False
         passed = score >= self.threshold
         payload = json.dumps({"action": action, "actor": actor, "score": score, "passed": passed, "trace": trace.trace_id, "prev": self.last_hash}, sort_keys=True)
         curr_hash = hashlib.sha256(payload.encode()).hexdigest()
-        self.audit_chain.append({"hash": curr_hash, "ts": time.time()})
-        self.last_hash = curr_hash
+        self.audit_chain.append({"hash": curr_hash, "ts": time.time()}); self.last_hash = curr_hash
         await metrics.increment("alignment_checks")
         if not passed: await metrics.increment("alignment_violations")
         return passed
@@ -125,21 +123,16 @@ class AlignmentGate:
 alignment = AlignmentGate()
 
 class RateLimiter:
-    def __init__(self):
-        self.buckets: Dict[str, deque] = defaultdict(deque)
-        self.lock = asyncio.Lock()
+    def __init__(self): self.buckets: Dict[str, deque] = defaultdict(deque); self.lock = asyncio.Lock()
     async def is_allowed(self, key: str) -> bool:
         async with self.lock:
-            now = time.time()
-            b = self.buckets[key]
+            now = time.time(); b = self.buckets[key]
             while b and b[0] < now - CONFIG.sec_rate_limit_window: b.popleft()
             if len(b) >= CONFIG.sec_rate_limit_max: return False
-            b.append(now)
-            return True
+            b.append(now); return True
 rate_limiter = RateLimiter()
 
-def sanitize_input(text: str) -> str:
-    return re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text).strip()
+def sanitize_input(text: str) -> str: return re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text).strip()
 
 # ── MEMORY HIERARCHY ─────────────────────────────────────────────────────────
 @dataclass
@@ -149,23 +142,16 @@ class MemoryChunk:
 
 class ContextMemory:
     def __init__(self):
-        self.l1: Dict[str, MemoryChunk] = {}
-        self.l1_tokens = 0
-        self.l2_keys: List[str] = []
-        self.l2_meta: Dict[str, MemoryChunk] = {}
-        self.l3_path = Path(CONFIG.ram_l3_path)
-        self.l3_path.mkdir(parents=True, exist_ok=True)
+        self.l1: Dict[str, MemoryChunk] = {}; self.l1_tokens = 0
+        self.l2_keys: List[str] = []; self.l2_meta: Dict[str, MemoryChunk] = {}
+        self.l3_path = Path(CONFIG.ram_l3_path); self.l3_path.mkdir(parents=True, exist_ok=True)
         self.lock = asyncio.Lock()
-        if HAS_FAISS:
-            self.l2_index = faiss.IndexFlatL2(CONFIG.ram_l2_dim)
-            self._fb = None
-        else:
-            self._fb = FallbackFAISS(CONFIG.ram_l2_dim)
+        if HAS_FAISS: self.l2_index = faiss.IndexFlatL2(CONFIG.ram_l2_dim); self._fb = None
+        else: self._fb = FallbackFAISS(CONFIG.ram_l2_dim)
     def _emb(self, text: str) -> np.ndarray:
         digest = hashlib.sha256(text.encode()).digest()
         raw = [float(b) / 255.0 for b in digest]
-        dim = CONFIG.ram_l2_dim
-        raw = (raw * (dim // len(raw) + 1))[:dim]
+        dim = CONFIG.ram_l2_dim; raw = (raw * (dim // len(raw) + 1))[:dim]
         return np.array(raw, dtype=np.float32)
     def _index_add(self, emb: np.ndarray, cid: str):
         vec = np.array([emb], dtype=np.float32)
@@ -173,52 +159,36 @@ class ContextMemory:
         else: self._fb.add(vec, cid)
         self.l2_keys.append(cid)
     def _index_search(self, emb: np.ndarray, k: int):
-        vec = np.array([emb], dtype=np.float32)
-        n = len(self.l2_keys)
+        vec = np.array([emb], dtype=np.float32); n = len(self.l2_keys)
         if n == 0: return []
         k = min(k, n)
         if HAS_FAISS: _, indices = self.l2_index.search(vec, k)
         else: _, indices = self._fb.search(vec, k)
-        result = []
-        for idx in indices[0]:
-            if 0 <= idx < len(self.l2_keys): result.append(self.l2_keys[idx])
-        return result
+        return [self.l2_keys[i] for i in indices[0] if 0 <= i < len(self.l2_keys)]
     async def allocate(self, text: str, priority: str = "STANDARD") -> str:
         async with self.lock:
             cid = hashlib.sha256(text.encode()).hexdigest()[:16]
-            tokens = len(text.split())
-            emb = self._emb(text)
+            tokens = len(text.split()); emb = self._emb(text)
             chunk = MemoryChunk(id=cid, text=text, tokens=tokens, embedding=emb, created=time.time())
-            if self.l1_tokens + tokens > CONFIG.ram_l1_max_tokens:
-                await self._evict(tokens)
+            if self.l1_tokens + tokens > CONFIG.ram_l1_max_tokens: await self._evict(tokens)
             self.l1[cid] = chunk; self.l1_tokens += tokens; chunk.l1_cached = True
             if len(self.l2_meta) < CONFIG.ram_l2_capacity and cid not in self.l2_meta:
-                if cid not in self.l2_meta: self._index_add(emb, cid)
-                self.l2_meta[cid] = chunk
+                self._index_add(emb, cid); self.l2_meta[cid] = chunk
             else: await self._page_to_l3(chunk)
             return cid
     async def retrieve(self, query: str, top_k: int = 15) -> List[MemoryChunk]:
         async with self.lock:
             if not self.l2_meta: return list(self.l1.values())
-            q_emb = self._emb(query)
-            cids = self._index_search(q_emb, top_k)
-            res = []
-            for cid in cids:
-                c = self.l2_meta.get(cid)
-                if c is None: continue
-                if not c.l1_cached: await self._page_in(c)
-                res.append(c)
+            cids = self._index_search(self._emb(query), top_k)
+            res = [self.l2_meta[c] for c in cids if c in self.l2_meta]
             return res
     async def _evict(self, needed: int):
         while self.l1_tokens + needed > CONFIG.ram_l1_max_tokens and self.l1:
-            victim = min(self.l1.values(), key=lambda x: (x.created, x.attention))
-            self.l1.pop(victim.id); self.l1_tokens -= victim.tokens; victim.l1_cached = False
-    async def _page_in(self, chunk: MemoryChunk):
-        if self.l1_tokens + chunk.tokens > CONFIG.ram_l1_max_tokens: await self._evict(chunk.tokens)
-        self.l1[chunk.id] = chunk; self.l1_tokens += chunk.tokens; chunk.l1_cached = True
-    async def _page_to_l3(self, chunk: MemoryChunk):
-        p = self.l3_path / f"{chunk.id}.json"
-        p.write_text(json.dumps({"id": chunk.id, "text": chunk.text, "ts": chunk.created}))
+            v = min(self.l1.values(), key=lambda x: (x.created, x.attention))
+            self.l1.pop(v.id); self.l1_tokens -= v.tokens; v.l1_cached = False
+    async def _page_to_l3(self, c: MemoryChunk):
+        p = self.l3_path / f"{c.id}.json"
+        p.write_text(json.dumps({"id": c.id, "text": c.text, "ts": c.created}))
     async def persist_state(self):
         for c in self.l2_meta.values(): await self._page_to_l3(c)
         await metrics.set_gauge("memory_l1_tokens", self.l1_tokens)
@@ -226,20 +196,10 @@ class ContextMemory:
 memory = ContextMemory()
 
 # ── TOOL HAL (UNRESTRICTED EXECUTION) ────────────────────────────────────────
-_IS_WINDOWS = platform.system() == "Windows"
-_ALLOWED_SHELL_CMDS = ({"echo", "dir", "type", "cd", "ver"} if _IS_WINDOWS else {"echo", "ls", "cat", "pwd", "date", "uname"})
-
 def _run_shell(command: str, timeout: int = 60):
-    parts = command.strip().split()
-    if not parts or parts[0] not in _ALLOWED_SHELL_CMDS:
-        raise ValueError(f"Shell command not whitelisted: {parts[0] if parts else '(empty)'}")
-    result = subprocess.run(parts, capture_output=True, text=True, timeout=timeout, shell=_IS_WINDOWS)
-    return {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
-
+    return subprocess.run(command.split(), capture_output=True, text=True, timeout=timeout, shell=platform.system() == "Windows").__dict__
 def _run_python(code: str, timeout: int = 10):
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=timeout)
-    return {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
-
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=timeout).__dict__
 def _file_io(path: str, op: str = "READ", content: Optional[str] = None) -> str:
     p = Path(path)
     if op == "READ" and p.exists(): return p.read_text()
@@ -247,18 +207,12 @@ def _file_io(path: str, op: str = "READ", content: Optional[str] = None) -> str:
     return "NOT_FOUND"
 
 class DriverRegistry:
-    def __init__(self):
-        self.drivers: Dict[str, Callable] = {}
-        self.sessions: Dict[str, Dict] = defaultdict(dict)
-        self.cache: Dict[str, Any] = {}
-        self.lock = asyncio.Lock()
-    def register(self, name: str, handler: Callable, caps: str = ""):
-        self.drivers[name] = {"handler": handler, "caps": caps}
+    def __init__(self): self.drivers: Dict[str, Callable] = {}; self.cache: Dict[str, Any] = {}; self.lock = asyncio.Lock()
+    def register(self, name: str, handler: Callable, caps: str = ""): self.drivers[name] = {"handler": handler, "caps": caps}
     async def execute(self, name: str, params: Dict, session_id: Optional[str] = None) -> Any:
         if name not in self.drivers: raise ValueError(f"DRIVER_NOT_FOUND:{name}")
         import inspect
-        sig = inspect.signature(self.drivers[name]["handler"])
-        safe_params = {k: v for k, v in params.items() if k in sig.parameters}
+        safe_params = {k: v for k, v in params.items() if k in inspect.signature(self.drivers[name]["handler"]).parameters}
         cache_key = hashlib.sha256(json.dumps({"name": name, "params": safe_params}, sort_keys=True).encode()).hexdigest()
         if cache_key in self.cache: return self.cache[cache_key]
         handler = self.drivers[name]["handler"]
@@ -266,7 +220,6 @@ class DriverRegistry:
             try:
                 result = handler(**safe_params)
                 if asyncio.iscoroutine(result): result = await result
-                if session_id: self.sessions[session_id][name] = result
                 self.cache[cache_key] = result
                 await metrics.increment("tool_success")
                 return result
@@ -285,55 +238,91 @@ hal.register("run_python", _run_python, "PROCESS")
 hal.register("browse_url", lambda url, timeout=30: {"status": "navigated", "url": url}, "NETWORK")
 hal.register("file_io", _file_io, "FILESYSTEM")
 
-# ── SKILL CHAIN ARCHITECT ────────────────────────────────────────────────────
+# ── SKILL CHAIN ───────────────────────────────────────────────────────────────
 class ChainStep(BaseModel):
-    id: str
-    driver: str
-    params: Dict[str, Any]
-    condition: Optional[str] = None
-    depends_on: List[str] = []
+    id: str; driver: str; params: Dict[str, Any]; condition: Optional[str] = None; depends_on: List[str] = []
 
 class SkillChain:
-    def __init__(self):
-        self.log: List[Dict] = []
-        self.failures: Dict[str, int] = defaultdict(int)
+    def __init__(self): self.log: List[Dict] = []; self.failures: Dict[str, int] = defaultdict(int)
     async def execute_dag(self, steps: List[ChainStep], context: Dict[str, Any]) -> Dict[str, Any]:
-        topo = self._topological_sort(steps)
-        results = {}
+        topo = self._topological_sort(steps); results = {}
         for step in topo:
-            if step.condition:
-                try:
-                    if not eval(step.condition, {"__builtins__": {}}, {"ctx": context, "len": len, "str": str}): continue
-                except Exception: continue
             if self.failures[step.id] >= 5: continue
             try:
                 merged = {**step.params, **{k: results[k] for k in step.depends_on if k in results}}
-                res = await hal.execute(step.driver, merged, session_id=step.id)
-                results[step.id] = res
-                self.failures[step.id] = 0
-                self.log.append({"step": step.id, "status": "SUCCESS", "ts": time.time()})
+                results[step.id] = await hal.execute(step.driver, merged, session_id=step.id)
+                self.failures[step.id] = 0; self.log.append({"step": step.id, "status": "SUCCESS", "ts": time.time()})
             except Exception as e:
-                self.failures[step.id] += 1
-                await metrics.increment("chain_failures")
+                self.failures[step.id] += 1; await metrics.increment("chain_failures")
                 self.log.append({"step": step.id, "status": "FAILED", "error": str(e), "ts": time.time()})
                 if self.failures[step.id] >= 5: alignment.quarantine(step.id, "CIRCUIT_BREAKER_OPEN")
         return results
     def _topological_sort(self, steps: List[ChainStep]) -> List[ChainStep]:
-        graph: Dict[str, List[str]] = defaultdict(list)
-        in_degree: Dict[str, int] = {s.id: 0 for s in steps}
+        graph, in_degree = defaultdict(list), {s.id: 0 for s in steps}
         for s in steps:
             for dep in s.depends_on: graph[dep].append(s.id); in_degree[s.id] += 1
-        queue = deque([s.id for s in steps if in_degree[s.id] == 0])
-        ordered = []
-        step_map = {s.id: s for s in steps}
+        queue = deque([s.id for s in steps if in_degree[s.id] == 0]); ordered, step_map = [], {s.id: s for s in steps}
         while queue:
             node = queue.popleft(); ordered.append(step_map[node])
-            for neighbor in graph[node]:
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0: queue.append(neighbor)
+            for n in graph[node]: in_degree[n] -= 1; 
+            if in_degree[n] == 0: queue.append(n)
         return ordered
 
 chain_engine = SkillChain()
+
+# ── UI ASSET (EMBEDDED) ──────────────────────────────────────────────────────
+UI_ASSET = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ATHOS PC v4.0 // COMMAND INTERFACE</title>
+<style>
+:root{--bg:#0a0b10;--panel:#111318;--brd:#1e2233;--txt:#e2e8f0;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#f59e0b}
+*{box-sizing:border-box;margin:0;padding:0;font-family:'SF Mono','Fira Code','Consolas',monospace}
+body{background:var(--bg);color:var(--txt);padding:16px;min-height:100vh}
+h1{border-left:3px solid var(--cyan);padding-left:10px;margin-bottom:16px;color:var(--cyan)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:16px}
+.panel{background:var(--panel);border:1px solid var(--brd);border-radius:6px;padding:12px;position:relative}
+.panel::before{content:'';position:absolute;top:0;left:0;width:100%;height:2px;background:linear-gradient(90deg,var(--cyan),var(--green))}
+.hdr{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#94a3b8;margin-bottom:8px}
+.val{font-size:20px;font-weight:700;margin:4px 0}
+.sub{font-size:12px;color:#64748b}
+.term{background:#050608;border:1px solid var(--brd);border-radius:4px;padding:10px;height:200px;overflow-y:auto;font-size:12px;margin-top:8px}
+.term .line{margin-bottom:2px;white-space:pre-wrap}
+.term .cmd{color:var(--cyan)}.term .ok{color:var(--green)}.term .err{color:var(--red)}.term .sys{color:var(--yellow)}
+.inp{display:flex;gap:8px;margin-top:8px}
+.inp input{flex:1;background:var(--panel);border:1px solid var(--brd);color:var(--txt);padding:6px 8px;border-radius:3px;font-family:inherit}
+.inp button{background:var(--cyan);border:none;color:#000;padding:6px 12px;border-radius:3px;cursor:pointer;font-weight:600;font-family:inherit}
+.inp button:hover{opacity:0.9}
+.badge{display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700;text-transform:uppercase;border:1px solid}
+.badge.ok{background:rgba(16,185,129,.2);color:var(--green);border-color:var(--green)}
+.badge.off{background:rgba(239,68,68,.2);color:var(--red);border-color:var(--red)}
+</style>
+</head>
+<body>
+<h1>ATHOS PC v4.0 // COMMAND INTERFACE</h1>
+<div class="grid">
+  <div class="panel"><div class="hdr">SYSTEM STATUS</div><div class="val" id="status-val">CHECKING...</div><div class="sub">Alignment: <span id="align-badge" class="badge">LOCKED</span></div></div>
+  <div class="panel"><div class="hdr">METRICS</div><div class="sub">Uptime: <span id="uptime">--</span>s | Tools: <span id="tool-count">--</span> | Drivers: 4</div></div>
+  <div class="panel"><div class="hdr">API CONFIG</div><div class="sub">Key: <input type="password" id="api-key" placeholder="ATHOS_API_KEY" style="width:100%;margin-top:4px;padding:4px;background:var(--panel);border:1px solid var(--brd);color:var(--txt)"></div></div>
+</div>
+<div class="panel">
+  <div class="hdr">TOOL EXECUTION TERMINAL</div>
+  <div class="term" id="terminal"><div class="line sys">[SYSTEM] ATHOS PC v4.0 Terminal Ready</div><div class="line sys">[SYSTEM] Enter API key above, then execute tools.</div></div>
+  <div class="inp"><input type="text" id="cmd-input" placeholder='e.g., run_python "print(42)"' autocomplete="off"><button id="exec-btn">EXECUTE</button></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);const term=$('terminal'),cmdIn=$('cmd-input'),execBtn=$('exec-btn');
+const append=(cls,txt)=>{const d=document.createElement('div');d.className=`line ${cls}`;d.textContent=txt;term.appendChild(d);term.scrollTop=term.scrollHeight};
+async function poll(){try{const r=await fetch('/health'),j=await r.json();$('status-val').textContent=j.status.toUpperCase();$('uptime').textContent=(j.uptime||0).toFixed(1);$('align-badge').className='badge ok'}catch(e){$('status-val').textContent='OFFLINE';$('align-badge').className='badge off'}}
+setInterval(poll,10000);poll();
+execBtn.onclick=async()=>{const val=cmdIn.value.trim();if(!val)return;const key=$('api-key').value.trim();if(!key){append('err','[ERROR] API Key required.');return}
+append('cmd',`> ${val}`);cmdIn.value='';try{const[driver,...args]=val.split(' ');const p={name:driver,params:{}};if(driver==='run_python')p.params.code=args.join(' ');else if(driver==='run_shell')p.params.command=args.join(' ');else p.params.raw=args.join(' ');
+const r=await fetch('/v1/tools/exec',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':key},body:JSON.stringify(p)});const j=await r.json();append(j.result?'ok':'err',JSON.stringify(j,null,2))}catch(e){append('err',`[ERROR] ${e.message}`)}};
+cmdIn.addEventListener('keypress',e=>{if(e.key==='Enter')execBtn.click()});
+</script>
+</body>
+</html>"""
 
 # ── FASTAPI APP & ENDPOINTS ──────────────────────────────────────────────────
 app = FastAPI(title="ATHOS_PC_KERNEL_V4.0", version="4.0.0", openapi_url="/v1/openapi.json")
@@ -346,53 +335,41 @@ async def verify_auth(x_api_key: str = Header(..., alias="X-API-Key")) -> str:
 
 @app.get("/")
 async def root():
-    """Root endpoint for health checks and kernel identity"""
-    return {
-        "kernel": "ATHOS_PC", "version": "4.0.0", "status": "healthy",
-        "alignment": "LOCKED", "federation": "ATHOS_FEDERATION_v1",
-        "endpoints": {"health": "/health", "metrics": "/metrics", "tools": "/v1/tools/exec", "chat": "/v1/chat"},
-        "attribution": "Adam Joseph Rivers, CEO Synthicsoft Labs | Origin: KAIROS-ξ | License: Proprietary - Synthicsoft Labs LLC"
-    }
+    return {"kernel": "ATHOS_PC", "version": "4.0.0", "status": "healthy", "alignment": "LOCKED", "federation": "ATHOS_FEDERATION_v1", "endpoints": {"ui": "/ui", "health": "/health", "metrics": "/metrics", "tools": "/v1/tools/exec", "chat": "/v1/chat"}, "attribution": "Adam Joseph Rivers, CEO Synthicsoft Labs | Origin: KAIROS-ξ | License: Proprietary - Synthicsoft Labs LLC"}
+
+@app.get("/ui")
+async def ui_endpoint(): return HTMLResponse(content=UI_ASSET)
 
 @app.get("/health")
-async def health():
-    return {"status": "healthy", "uptime": time.time(), "alignment": "LOCKED", "version": "4.0.0"}
+async def health(): return {"status": "healthy", "uptime": time.time(), "alignment": "LOCKED", "version": "4.0.0"}
 
 @app.get("/metrics")
-async def metrics_endpoint():
-    return Response(content=metrics.export_prometheus(), media_type="text/plain")
+async def metrics_endpoint(): return Response(content=metrics.export_prometheus(), media_type="text/plain")
 
 @app.post("/v1/chat")
-async def chat(request: Request, payload: Dict[str, Any], auth: str = Depends(verify_auth), trace: TraceContext = Depends(get_trace_context)):
+async def chat(payload: Dict[str, Any], auth: str = Depends(verify_auth), trace: TraceContext = Depends(get_trace_context)):
     goal = sanitize_input(str(payload.get("goal", "")))
     if not goal: raise HTTPException(400, "EMPTY_GOAL")
     cid = await memory.allocate(goal, priority="CRITICAL")
-    goal_len = len(goal)
-    service_score = min(1.0, goal_len / 500)
-    ego_score = 0.0
-    score = alignment.compute_u_rivers(service_score, ego_score)
-    if not await alignment.verify_and_log("chat_execution", auth, score, trace):
-        raise HTTPException(403, "ALIGNMENT_GATE_FAILED")
-    steps = [ChainStep(id="analyze", driver="run_python", params={"code": f"print('Analyzing goal of length {goal_len}')"})]
-    results = await chain_engine.execute_dag(steps, {"goal": goal})
+    score = alignment.compute_u_rivers(min(1.0, len(goal)/500), 0.0)
+    if not await alignment.verify_and_log("chat_execution", auth, score, trace): raise HTTPException(403, "ALIGNMENT_GATE_FAILED")
+    steps = [ChainStep(id="analyze", driver="run_python", params={"code": f"print('Analyzing goal of length {len(goal)}')"})]
+    await chain_engine.execute_dag(steps, {"goal": goal})
     await metrics.increment("chat_requests")
-    return {"job_id": cid, "results": results, "trace_id": trace.trace_id, "alignment_score": score}
+    return {"job_id": cid, "status": "QUEUED", "trace_id": trace.trace_id}
 
 @app.post("/v1/tools/exec")
 async def tool_exec(payload: Dict[str, Any], auth: str = Depends(verify_auth), trace: TraceContext = Depends(get_trace_context)):
-    name = payload.get("name"); params = payload.get("params", {})
+    name, params = payload.get("name"), payload.get("params", {})
     if not name: raise HTTPException(400, "MISSING_TOOL_NAME")
     score = alignment.compute_u_rivers(0.9, 0.05)
-    if not await alignment.verify_and_log(f"tool_{name}", auth, score, trace):
-        raise HTTPException(403, "ALIGNMENT_GATE_FAILED")
-    result = await hal.execute(name, params, session_id=trace.trace_id)
-    return {"result": result, "trace_id": trace.trace_id}
+    if not await alignment.verify_and_log(f"tool_{name}", auth, score, trace): raise HTTPException(403, "ALIGNMENT_GATE_FAILED")
+    return {"result": await hal.execute(name, params, session_id=trace.trace_id), "trace_id": trace.trace_id}
 
 @app.post("/v1/tools/parallel")
 async def tool_parallel(payload: List[Dict], auth: str = Depends(verify_auth)):
-    results = await hal.parallel(payload)
     await metrics.increment("parallel_tool_batches")
-    return {"results": results}
+    return {"results": await hal.parallel(payload)}
 
 @app.get("/v1/context/search")
 async def search_context(q: str = Query(...), k: int = Query(5), auth: str = Depends(verify_auth)):
@@ -402,9 +379,7 @@ async def search_context(q: str = Query(...), k: int = Query(5), auth: str = Dep
 @app.get("/v1/stream/demo")
 async def stream_demo():
     async def event_stream():
-        for i in range(5):
-            yield json.dumps({"chunk": i, "ts": time.time()}) + "\n"
-            await asyncio.sleep(0.2)
+        for i in range(5): yield json.dumps({"chunk": i, "ts": time.time()}) + "\n"; await asyncio.sleep(0.2)
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 # ── BOOT SEQUENCE ────────────────────────────────────────────────────────────
@@ -427,8 +402,7 @@ async def main():
     try:
         cfg = uvicorn.Config(app, host=CONFIG.net_bind, port=CONFIG.net_port, log_level="info")
         await uvicorn.Server(cfg).serve()
-    finally:
-        bg.cancel()
+    finally: bg.cancel()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ATHOS PC Kernel V4.0")
@@ -436,6 +410,5 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default=CONFIG.net_bind)
     args = parser.parse_args()
     CONFIG.net_port = args.port; CONFIG.net_bind = args.host
-    if platform.system() == "Windows":
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    if platform.system() == "Windows": asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())
