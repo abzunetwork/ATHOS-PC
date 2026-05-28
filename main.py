@@ -198,8 +198,15 @@ memory = ContextMemory()
 # ── TOOL HAL (UNRESTRICTED EXECUTION) ────────────────────────────────────────
 def _run_shell(command: str, timeout: int = 60):
     return subprocess.run(command.split(), capture_output=True, text=True, timeout=timeout, shell=platform.system() == "Windows").__dict__
+
 def _run_python(code: str, timeout: int = 10):
-    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=timeout).__dict__
+    # FIX: Strip surrounding quotes that terminal UI might pass
+    code = code.strip()
+    if len(code) >= 2 and ((code.startswith('"') and code.endswith('"')) or (code.startswith("'") and code.endswith("'"))):
+        code = code[1:-1]
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=timeout)
+    return {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+
 def _file_io(path: str, op: str = "READ", content: Optional[str] = None) -> str:
     p = Path(path)
     if op == "READ" and p.exists(): return p.read_text()
@@ -316,9 +323,22 @@ const $=id=>document.getElementById(id);const term=$('terminal'),cmdIn=$('cmd-in
 const append=(cls,txt)=>{const d=document.createElement('div');d.className=`line ${cls}`;d.textContent=txt;term.appendChild(d);term.scrollTop=term.scrollHeight};
 async function poll(){try{const r=await fetch('/health'),j=await r.json();$('status-val').textContent=j.status.toUpperCase();$('uptime').textContent=(j.uptime||0).toFixed(1);$('align-badge').className='badge ok'}catch(e){$('status-val').textContent='OFFLINE';$('align-badge').className='badge off'}}
 setInterval(poll,10000);poll();
-execBtn.onclick=async()=>{const val=cmdIn.value.trim();if(!val)return;const key=$('api-key').value.trim();if(!key){append('err','[ERROR] API Key required.');return}
-append('cmd',`> ${val}`);cmdIn.value='';try{const[driver,...args]=val.split(' ');const p={name:driver,params:{}};if(driver==='run_python')p.params.code=args.join(' ');else if(driver==='run_shell')p.params.command=args.join(' ');else p.params.raw=args.join(' ');
-const r=await fetch('/v1/tools/exec',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':key},body:JSON.stringify(p)});const j=await r.json();append(j.result?'ok':'err',JSON.stringify(j,null,2))}catch(e){append('err',`[ERROR] ${e.message}`)}};
+execBtn.onclick=async()=>{
+  const val=cmdIn.value.trim();if(!val)return;const key=$('api-key').value.trim();if(!key){append('err','[ERROR] API Key required.');return}
+  append('cmd',`> ${val}`);cmdIn.value='';try{
+    // FIX: Quote-aware parsing
+    const spaceIdx = val.indexOf(' ');
+    const driver = spaceIdx !== -1 ? val.substring(0, spaceIdx) : val;
+    const rawArgs = spaceIdx !== -1 ? val.substring(spaceIdx + 1) : '';
+    const p={name:driver,params:{}};
+    if(driver==='run_python') p.params.code=rawArgs;
+    else if(driver==='run_shell') p.params.command=rawArgs;
+    else p.params.raw=rawArgs;
+    const r=await fetch('/v1/tools/exec',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':key},body:JSON.stringify(p)});
+    const j=await r.json();
+    append(j.detail==='INVALID_KEY'?'err':(j.result?'ok':'err'),JSON.stringify(j,null,2))
+  }catch(e){append('err',`[ERROR] ${e.message}`)}
+};
 cmdIn.addEventListener('keypress',e=>{if(e.key==='Enter')execBtn.click()});
 </script>
 </body>
@@ -345,6 +365,9 @@ async def health(): return {"status": "healthy", "uptime": time.time(), "alignme
 
 @app.get("/metrics")
 async def metrics_endpoint(): return Response(content=metrics.export_prometheus(), media_type="text/plain")
+
+@app.get("/v1/auth/verify")
+async def verify_key(auth: str = Depends(verify_auth)): return {"status": "VALID", "key_prefix": ATHOS_API_KEY[:8]+"..."}
 
 @app.post("/v1/chat")
 async def chat(payload: Dict[str, Any], auth: str = Depends(verify_auth), trace: TraceContext = Depends(get_trace_context)):
