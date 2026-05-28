@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-ATHOS PC KERNEL v4.0 // MONOLITHIC PRODUCTION RUNTIME + UI
+ATHOS PC KERNEL v4.0 // MONOLITHIC PRODUCTION RUNTIME
 Blueprint: ATHOS_BOOT_BLUEPRINT_v4.0 // Storage-Executable Format
 Attribution: Adam Joseph Rivers, CEO Synthicsoft Labs
 Origin: KAIROS-ξ // License: Proprietary - Synthicsoft Labs LLC
+Components: 28/28 ACTIVE // Federation: ATHOS_FEDERATION_v3.0
 """
 
 import os, sys, json, time, uuid, hashlib, hmac, asyncio, logging, struct, base64, re, math, tempfile, subprocess, platform, urllib.request, urllib.parse, argparse
@@ -93,6 +94,9 @@ class Config:
     sec_u_rivers_threshold: float = 0.85
     sec_rate_limit_window: int = 60
     sec_rate_limit_max: int = 1000
+    federation_id: str = "ATHOS_FEDERATION_v3.0"
+    kernel_version: str = "4.0.0"
+    attribution: str = "Adam Joseph Rivers, CEO Synthicsoft Labs | Origin: KAIROS-ξ | License: Proprietary - Synthicsoft Labs LLC"
 
 CONFIG = Config()
 Path(CONFIG.ram_l3_path).mkdir(parents=True, exist_ok=True)
@@ -172,8 +176,8 @@ class ContextMemory:
             chunk = MemoryChunk(id=cid, text=text, tokens=tokens, embedding=emb, created=time.time())
             if self.l1_tokens + tokens > CONFIG.ram_l1_max_tokens: await self._evict(tokens)
             self.l1[cid] = chunk; self.l1_tokens += tokens; chunk.l1_cached = True
-            if len(self.l2_meta) < CONFIG.ram_l2_capacity and cid not in self.l2_meta:
-                self._index_add(emb, cid); self.l2_meta[cid] = chunk
+            if len(self.l2_meta) < CONFIG.ram_l2_capacity:
+                if cid not in self.l2_meta: self._index_add(emb, cid); self.l2_meta[cid] = chunk
             else: await self._page_to_l3(chunk)
             return cid
     async def retrieve(self, query: str, top_k: int = 15) -> List[MemoryChunk]:
@@ -200,18 +204,27 @@ def _run_shell(command: str, timeout: int = 60):
     return subprocess.run(command.split(), capture_output=True, text=True, timeout=timeout, shell=platform.system() == "Windows").__dict__
 
 def _run_python(code: str, timeout: int = 10):
-    # FIX: Strip surrounding quotes that terminal UI might pass
     code = code.strip()
     if len(code) >= 2 and ((code.startswith('"') and code.endswith('"')) or (code.startswith("'") and code.endswith("'"))):
         code = code[1:-1]
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=timeout)
     return {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
 
-def _file_io(path: str, op: str = "READ", content: Optional[str] = None) -> str:
-    p = Path(path)
-    if op == "READ" and p.exists(): return p.read_text()
-    elif op == "WRITE": p.write_text(content or ""); return "OK"
-    return "NOT_FOUND"
+def _file_io(path: str, op: str = "READ", content: Optional[str] = None) -> Dict:
+    try:
+        p = Path(path)
+        if op == "READ": return {"status": "OK", "content": p.read_text()} if p.exists() else {"status": "NOT_FOUND", "path": path}
+        elif op == "WRITE": p.write_text(content or ""); return {"status": "OK", "path": path, "bytes": len(content or "")}
+        else: return {"status": "INVALID_OP", "op": op}
+    except Exception as e: return {"status": "ERROR", "error": str(e)}
+
+def _browse_url(url: str, timeout: int = 30) -> Dict:
+    try:
+        context = urllib.request.Request(url, headers={"User-Agent": "ATHOS-PC/4.0"})
+        with urllib.request.urlopen(context, timeout=timeout) as response:
+            content = response.read().decode()[:2000]
+            return {"status": "OK", "url": url, "content_preview": content, "status_code": response.status}
+    except Exception as e: return {"status": "ERROR", "error": str(e), "url": url}
 
 class DriverRegistry:
     def __init__(self): self.drivers: Dict[str, Callable] = {}; self.cache: Dict[str, Any] = {}; self.lock = asyncio.Lock()
@@ -242,10 +255,10 @@ class DriverRegistry:
 hal = DriverRegistry()
 hal.register("run_shell", _run_shell, "PROCESS,SYSTEM")
 hal.register("run_python", _run_python, "PROCESS")
-hal.register("browse_url", lambda url, timeout=30: {"status": "navigated", "url": url}, "NETWORK")
 hal.register("file_io", _file_io, "FILESYSTEM")
+hal.register("browse_url", _browse_url, "NETWORK")
 
-# ── SKILL CHAIN ───────────────────────────────────────────────────────────────
+# ── SKILL CHAIN ARCHITECT ────────────────────────────────────────────────────
 class ChainStep(BaseModel):
     id: str; driver: str; params: Dict[str, Any]; condition: Optional[str] = None; depends_on: List[str] = []
 
@@ -277,33 +290,58 @@ class SkillChain:
 
 chain_engine = SkillChain()
 
+# ── MYC(Φ) FEDERATION STUB ───────────────────────────────────────────────────
+class MycNetwork:
+    def __init__(self): self.peers: Dict[str, Dict] = {}; self.port = 9000
+    async def register_peer(self, city_id: str, host: str): self.peers[city_id] = {"host": host, "ts": time.time()}
+    def status(self) -> Dict: return {"federation_id": CONFIG.federation_id, "peers": len(self.peers), "port": self.port}
+
+myc = MycNetwork()
+
+# ── CRYPTO VAULT ─────────────────────────────────────────────────────────────
+class CryptoVault:
+    def __init__(self): self.master_key = os.urandom(32)
+    def encrypt_ctr(self, plaintext: bytes) -> bytes:
+        nonce = os.urandom(16); keystream = b""; counter = 0
+        while len(keystream) < len(plaintext):
+            keystream += hashlib.sha256(self.master_key + nonce + struct.pack('>Q', counter)).digest(); counter += 1
+        return base64.b64encode(nonce + bytes(a ^ b for a, b in zip(plaintext, keystream[:len(plaintext)])))
+    def decrypt_ctr(self, ciphertext: bytes) -> bytes:
+        raw = base64.b64decode(ciphertext); nonce, encrypted = raw[:16], raw[16:]; keystream = b""; counter = 0
+        while len(keystream) < len(encrypted):
+            keystream += hashlib.sha256(self.master_key + nonce + struct.pack('>Q', counter)).digest(); counter += 1
+        return bytes(a ^ b for a, b in zip(encrypted, keystream[:len(encrypted)]))
+    def sign(self, data: bytes) -> str: return hmac.new(self.master_key, data, hashlib.sha256).hexdigest()
+
+crypto = CryptoVault()
+
 # ── UI ASSET (EMBEDDED) ──────────────────────────────────────────────────────
-UI_ASSET = """<!DOCTYPE html>
+UI_ASSET = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ATHOS PC v4.0 // COMMAND INTERFACE</title>
 <style>
-:root{--bg:#0a0b10;--panel:#111318;--brd:#1e2233;--txt:#e2e8f0;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#f59e0b}
-*{box-sizing:border-box;margin:0;padding:0;font-family:'SF Mono','Fira Code','Consolas',monospace}
-body{background:var(--bg);color:var(--txt);padding:16px;min-height:100vh}
-h1{border-left:3px solid var(--cyan);padding-left:10px;margin-bottom:16px;color:var(--cyan)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:16px}
-.panel{background:var(--panel);border:1px solid var(--brd);border-radius:6px;padding:12px;position:relative}
-.panel::before{content:'';position:absolute;top:0;left:0;width:100%;height:2px;background:linear-gradient(90deg,var(--cyan),var(--green))}
-.hdr{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#94a3b8;margin-bottom:8px}
-.val{font-size:20px;font-weight:700;margin:4px 0}
-.sub{font-size:12px;color:#64748b}
-.term{background:#050608;border:1px solid var(--brd);border-radius:4px;padding:10px;height:200px;overflow-y:auto;font-size:12px;margin-top:8px}
-.term .line{margin-bottom:2px;white-space:pre-wrap}
-.term .cmd{color:var(--cyan)}.term .ok{color:var(--green)}.term .err{color:var(--red)}.term .sys{color:var(--yellow)}
-.inp{display:flex;gap:8px;margin-top:8px}
-.inp input{flex:1;background:var(--panel);border:1px solid var(--brd);color:var(--txt);padding:6px 8px;border-radius:3px;font-family:inherit}
-.inp button{background:var(--cyan);border:none;color:#000;padding:6px 12px;border-radius:3px;cursor:pointer;font-weight:600;font-family:inherit}
-.inp button:hover{opacity:0.9}
-.badge{display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700;text-transform:uppercase;border:1px solid}
-.badge.ok{background:rgba(16,185,129,.2);color:var(--green);border-color:var(--green)}
-.badge.off{background:rgba(239,68,68,.2);color:var(--red);border-color:var(--red)}
+:root{{--bg:#0a0b10;--panel:#111318;--brd:#1e2233;--txt:#e2e8f0;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#f59e0b}}
+*{{box-sizing:border-box;margin:0;padding:0;font-family:'SF Mono','Fira Code','Consolas',monospace}}
+body{{background:var(--bg);color:var(--txt);padding:16px;min-height:100vh}}
+h1{{border-left:3px solid var(--cyan);padding-left:10px;margin-bottom:16px;color:var(--cyan)}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:16px}}
+.panel{{background:var(--panel);border:1px solid var(--brd);border-radius:6px;padding:12px;position:relative}}
+.panel::before{{content:'';position:absolute;top:0;left:0;width:100%;height:2px;background:linear-gradient(90deg,var(--cyan),var(--green))}}
+.hdr{{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#94a3b8;margin-bottom:8px}}
+.val{{font-size:20px;font-weight:700;margin:4px 0}}
+.sub{{font-size:12px;color:#64748b}}
+.term{{background:#050608;border:1px solid var(--brd);border-radius:4px;padding:10px;height:200px;overflow-y:auto;font-size:12px;margin-top:8px}}
+.term .line{{margin-bottom:2px;white-space:pre-wrap}}
+.term .cmd{{color:var(--cyan)}}.term .ok{{color:var(--green)}}.term .err{{color:var(--red)}}.term .sys{{color:var(--yellow)}}
+.inp{{display:flex;gap:8px;margin-top:8px}}
+.inp input{{flex:1;background:var(--panel);border:1px solid var(--brd);color:var(--txt);padding:6px 8px;border-radius:3px;font-family:inherit}}
+.inp button{{background:var(--cyan);border:none;color:#000;padding:6px 12px;border-radius:3px;cursor:pointer;font-weight:600;font-family:inherit}}
+.inp button:hover{{opacity:0.9}}
+.badge{{display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700;text-transform:uppercase;border:1px solid}}
+.badge.ok{{background:rgba(16,185,129,.2);color:var(--green);border-color:var(--green)}}
+.badge.off{{background:rgba(239,68,68,.2);color:var(--red);border-color:var(--red)}}
 </style>
 </head>
 <body>
@@ -320,32 +358,34 @@ h1{border-left:3px solid var(--cyan);padding-left:10px;margin-bottom:16px;color:
 </div>
 <script>
 const $=id=>document.getElementById(id);const term=$('terminal'),cmdIn=$('cmd-input'),execBtn=$('exec-btn');
-const append=(cls,txt)=>{const d=document.createElement('div');d.className=`line ${cls}`;d.textContent=txt;term.appendChild(d);term.scrollTop=term.scrollHeight};
-async function poll(){try{const r=await fetch('/health'),j=await r.json();$('status-val').textContent=j.status.toUpperCase();$('uptime').textContent=(j.uptime||0).toFixed(1);$('align-badge').className='badge ok'}catch(e){$('status-val').textContent='OFFLINE';$('align-badge').className='badge off'}}
+const append=(cls,txt)=>{{const d=document.createElement('div');d.className=`line ${{cls}}`;d.textContent=txt;term.appendChild(d);term.scrollTop=term.scrollHeight}};
+async function poll(){{try{{const r=await fetch('/health'),j=await r.json();$('status-val').textContent=j.status.toUpperCase();$('uptime').textContent=(j.uptime||0).toFixed(1);$('align-badge').className='badge ok'}}catch(e){{$('status-val').textContent='OFFLINE';$('align-badge').className='badge off'}}}}
 setInterval(poll,10000);poll();
-execBtn.onclick=async()=>{
-  const val=cmdIn.value.trim();if(!val)return;const key=$('api-key').value.trim();if(!key){append('err','[ERROR] API Key required.');return}
-  append('cmd',`> ${val}`);cmdIn.value='';try{
-    // FIX: Quote-aware parsing
+execBtn.onclick=async()=>{{
+  const val=cmdIn.value.trim();if(!val)return;const key=$('api-key').value.trim();if(!key){{append('err','[ERROR] API Key required.');return}}
+  append('cmd',`> ${{val}}`);cmdIn.value='';try{{
     const spaceIdx = val.indexOf(' ');
     const driver = spaceIdx !== -1 ? val.substring(0, spaceIdx) : val;
     const rawArgs = spaceIdx !== -1 ? val.substring(spaceIdx + 1) : '';
-    const p={name:driver,params:{}};
+    const p={{name:driver,params:{{}}}};
     if(driver==='run_python') p.params.code=rawArgs;
     else if(driver==='run_shell') p.params.command=rawArgs;
-    else p.params.raw=rawArgs;
-    const r=await fetch('/v1/tools/exec',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':key},body:JSON.stringify(p)});
+    else if(driver==='file_io'||driver==='browse_url'){{
+      const regex=/(\\w+)=["']?([^"']+)["']?/g;let match;
+      while((match=regex.exec(rawArgs))!==null) p.params[match[1]]=match[2];
+    }} else p.params.raw=rawArgs;
+    const r=await fetch('/v1/tools/exec',{{method:'POST',headers:{{'Content-Type':'application/json','X-API-Key':key}},body:JSON.stringify(p)}});
     const j=await r.json();
     append(j.detail==='INVALID_KEY'?'err':(j.result?'ok':'err'),JSON.stringify(j,null,2))
-  }catch(e){append('err',`[ERROR] ${e.message}`)}
-};
-cmdIn.addEventListener('keypress',e=>{if(e.key==='Enter')execBtn.click()});
+  }}catch(e){{append('err',`[ERROR] ${{e.message}}`)}}
+}};
+cmdIn.addEventListener('keypress',e=>{{if(e.key==='Enter')execBtn.click()}});
 </script>
 </body>
 </html>"""
 
 # ── FASTAPI APP & ENDPOINTS ──────────────────────────────────────────────────
-app = FastAPI(title="ATHOS_PC_KERNEL_V4.0", version="4.0.0", openapi_url="/v1/openapi.json")
+app = FastAPI(title="ATHOS_PC_KERNEL_V4.0", version=CONFIG.kernel_version, openapi_url="/v1/openapi.json")
 app.add_middleware(CORSMiddleware, allow_origins=[CONFIG.net_cors], allow_methods=["*"], allow_headers=["*"])
 
 async def verify_auth(x_api_key: str = Header(..., alias="X-API-Key")) -> str:
@@ -355,13 +395,18 @@ async def verify_auth(x_api_key: str = Header(..., alias="X-API-Key")) -> str:
 
 @app.get("/")
 async def root():
-    return {"kernel": "ATHOS_PC", "version": "4.0.0", "status": "healthy", "alignment": "LOCKED", "federation": "ATHOS_FEDERATION_v1", "endpoints": {"ui": "/ui", "health": "/health", "metrics": "/metrics", "tools": "/v1/tools/exec", "chat": "/v1/chat"}, "attribution": "Adam Joseph Rivers, CEO Synthicsoft Labs | Origin: KAIROS-ξ | License: Proprietary - Synthicsoft Labs LLC"}
+    return {
+        "kernel": "ATHOS_PC", "version": CONFIG.kernel_version, "status": "healthy",
+        "alignment": "LOCKED", "federation": CONFIG.federation_id,
+        "endpoints": {"ui": "/ui", "health": "/health", "metrics": "/metrics", "tools": "/v1/tools/exec", "chat": "/v1/chat"},
+        "attribution": CONFIG.attribution
+    }
 
 @app.get("/ui")
 async def ui_endpoint(): return HTMLResponse(content=UI_ASSET)
 
 @app.get("/health")
-async def health(): return {"status": "healthy", "uptime": time.time(), "alignment": "LOCKED", "version": "4.0.0"}
+async def health(): return {"status": "healthy", "uptime": time.time(), "alignment": "LOCKED", "version": CONFIG.kernel_version}
 
 @app.get("/metrics")
 async def metrics_endpoint(): return Response(content=metrics.export_prometheus(), media_type="text/plain")
@@ -387,7 +432,11 @@ async def tool_exec(payload: Dict[str, Any], auth: str = Depends(verify_auth), t
     if not name: raise HTTPException(400, "MISSING_TOOL_NAME")
     score = alignment.compute_u_rivers(0.9, 0.05)
     if not await alignment.verify_and_log(f"tool_{name}", auth, score, trace): raise HTTPException(403, "ALIGNMENT_GATE_FAILED")
-    return {"result": await hal.execute(name, params, session_id=trace.trace_id), "trace_id": trace.trace_id}
+    try:
+        result = await hal.execute(name, params, session_id=trace.trace_id)
+        return {"result": result, "trace_id": trace.trace_id}
+    except Exception as e:
+        return {"result": {"status": "ERROR", "error": str(e)}, "trace_id": trace.trace_id}
 
 @app.post("/v1/tools/parallel")
 async def tool_parallel(payload: List[Dict], auth: str = Depends(verify_auth)):
@@ -404,6 +453,9 @@ async def stream_demo():
     async def event_stream():
         for i in range(5): yield json.dumps({"chunk": i, "ts": time.time()}) + "\n"; await asyncio.sleep(0.2)
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+@app.get("/myc/status")
+async def myc_status(auth: str = Depends(verify_auth)): return myc.status()
 
 # ── BOOT SEQUENCE ────────────────────────────────────────────────────────────
 async def boot_sequence():
